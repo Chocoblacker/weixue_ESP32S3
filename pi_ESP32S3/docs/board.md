@@ -216,6 +216,115 @@ xiaozhi 有 `self.upgrade_firmware` 这个 MCP 工具，**它自己能 OTA**，
 而且用的是同一套轮转算法 → 如果用它，它可能占掉 `ota_0` / `ota_1`。
 按“xiaozhi 不丢就行”的决定，这不是问题：文件在手，直接收回槽位。
 
+## ❗ 小智为什么会“离线”（回滚机制全解）
+
+### 现象
+
+把启动项切到 `ota_0` 后，小智能跑，但**几次复位后就把 `otadata` 擦空、退回 `factory`**（= 我们的固件）。
+云端控制台因此显示设备离线 —— 因为板子上根本没在跑小智了。
+
+实测记录（写入 `state=VALID` 也不管用）：
+
+| 启动 | 实际跑的 | otadata |
+| --- | --- | --- |
+| boot#1 | xiaozhi | `seq=1` 完好 |
+| boot#2 | xiaozhi | `seq=1` 完好 |
+| boot#3 | xiaozhi 起来后自己重启了 | **被擦成 0xFFFFFFFF** |
+
+### 根因（源码级）
+
+小智固件里含 IDF 的 rollback 日志串，证明它编译时开了 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`，
+并且运行中调用 `esp_ota_mark_app_invalid_rollback_and_reboot()`：
+
+```
+✅ "Rollback to previously worked partition."
+✅ "Rollback is not possible, do not have any suitable apps in slots"
+✅ "Running app has not confirmed state (ESP_OTA_IMG_PENDING_VERIFY)"
+```
+
+回滚时找不到可用的“上一个 OTA 镜像”，IDF 就去 `esp_ota_set_boot_partition(factory)`，
+而那个函数遇到 factory 会**直接擦掉整个 otadata 分区** —— 这就是我们看到的现象。
+
+### 关键：从 factory 启动时，这套回滚代码会自我失效
+
+`components/app_update/esp_ota_ops.c` → `esp_ota_current_ota_is_workable()`：
+
+```c
+int active_otadata = bootloader_common_get_active_otadata(otadata);
+if (active_otadata != -1 && esp_ota_get_app_partition_count() != 0) {
+    ...  // 只有这里才会标 INVALID / 回滚
+} else {
+    ESP_LOGE(TAG, "Running firmware is factory");
+    return ESP_FAIL;          // ← 从 factory 启动，直接失败返回
+}
+```
+
+而 `esp_ota_mark_app_invalid_rollback_and_reboot()` 只在 `ret == ESP_OK` 时才 `esp_restart()`。
+
+> **所以：小智跑在 `factory` 里时，它那套回滚逻辑完全退化成无害的空操作，不会重启循环，也不会碰 otadata。**
+
+### 附带发现：CRC 只算 `seq` 4 个字节
+
+```c
+uint32_t bootloader_common_ota_select_crc(const esp_ota_select_entry_t *s)
+{
+    return esp_rom_crc32_le(UINT32_MAX, (uint8_t*)&s->ota_seq, 4);   // 只有 4 字节
+}
+```
+
+所以 `ota_select_entry_t` 里的 `seq_label[20]` 和 `ota_state` **不参与校验**，可以随便改。
+状态常量（`esp_flash_partitions.h`）：
+
+```
+NEW=0x0  PENDING_VERIFY=0x1  VALID=0x2  INVALID=0x3  ABORTED=0x4  UNDEFINED=0xFFFFFFFF
+```
+
+otatool 的 `switch_ota_partition` 也只写 `seq`（偏移 0）和 `crc`（偏移 28），故意不碰 `state`。
+
+### 仍然存在的两个 assets 报错
+
+```
+E Assets: The calculated checksum (0x15c) does not match the stored checksum (0x4214b43c)
+E Assets: The index.json file is not found
+```
+
+spiffs 的 `assets` 分区（26.9% 有数据，2.5MB）里的资源包与当前固件版本**对不上**，
+`index.json` 不存在。**这很可能就是它当初想回滚的真正触发条件。**
+核心功能（唤醒/对话）不受影响，只是字库/图片资源可能退化到内置的。
+
+## 最终分区与固件布局（2026-09-18）
+
+```
+nvsfactory 0x9000    200K   ← 不动
+nvs        0x3b000   840K   ← 不动（WiFi 凭据在这里）
+otadata    0x10d000  8K     ← 空 => 默认启动 factory = 小智
+phy_init   0x10f000  4K     ← 不动
+factory    0x110000  9M     ← 🟢 小智 2.1.0（稳定、OTA 永不碰它）
+ota_0      0xa10000  4032K  ← 🔵 我们的 lvgl_demo_v9（休眠中）
+ota_1      0xe00000  4032K  ← 空，给我们做 A/B OTA 备用
+assets     0x11f0000 9M     ← 不动（小智资源）
+storage    0x1af0000 5M     ← 不动（小智存储）
+```
+
+**记忆规则：`otadata` 空 → 启动小智；`otadata` 指向 slot 0 → 启动我们的固件。**
+
+```bash
+source scripts/env.sh
+OT=$IDF_PATH/components/app_update/otatool.py
+
+python3 $OT --port /dev/ttyACM0 erase_otadata              # 切到小智
+python3 $OT --port /dev/ttyACM0 switch_ota_partition --slot 0   # 切到我们的
+python3 $OT --port /dev/ttyACM0 read_otadata               # 看当前
+```
+
+### 代价 / 注意
+
+- `idf.py flash` 会擦掉 `otadata` → 烧完默认回到小智。要跑我们的固件得再补一条
+  `switch_ota_partition --slot 0`。
+- 小智的 `self.upgrade_firmware`（自升级）算出的下一个槽位是 **`ota_0` = 我们的槽位**。
+  别在用小智的时候碰它的自动升级。
+- 我们自己的 A/B OTA 只需要 `ota_0` / `ota_1` 两槽，现在是齐的。
+
 ## 切换启动分区（不刷固件，只改 otadata）
 
 ```bash
