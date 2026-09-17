@@ -63,22 +63,23 @@ cd projects/my_app && idf-build && idf-fm
 - [x] 板子确认联网可达（MAC `80:45:6b:34:25:18`，OUI 确认为 Espressif）
 - [x] USB 透传（usbipd-win，`/dev/ttyACM0` 可用）
 - [x] ESP-IDF v5.5.5 工具链装好，子模块补齐
-- [x] **build → flash → monitor 闭环打通**，板上跑着 `projects/lvgl_demo_v9`
+- [x] **build → flash → monitor 闭环打通**
 - [x] 32MB 整片备份存档
-- [ ] 给固件加 OTA，之后纯 Wi-Fi 迭代，不再需要 USB
-- [ ] 定下自己的工程骨架（现在还用着官方示例副本）
+- [x] **OTA 打通：改代码不再需要插 USB**（`projects/ota_app` + `docs/ota.md`）
+- [ ] 定下正式工程（现在还是 bring-up 阶段的应用）
 
 第一次跑通的全过程、踩的坑、板上原有固件的清单，都在
 👉 [`docs/bringup-log.md`](docs/bringup-log.md)
+
+OTA 日常开发流程（推固件、回滚、排错）👉 [`docs/ota.md`](docs/ota.md)
 
 环境与网络细节见 [`docs/environment.md`](docs/environment.md) 与 [`docs/network.md`](docs/network.md)。
 
 ## 板上现状（重要）
 
-`factory` 分区（0x110000）现在是我们的 `lvgl_demo_v9`。
-`ota_0` 里原来的 **xiaozhi 2.1.0** 和 NVS（WiFi 凭据）**没被动过** ——
-我们烧录时特意改用板上自带的分区表（`projects/board-partitions.csv`）而不是
-示例自带的，后者会冲掉 NVS。
+`factory` 分区（0x110000）现在是 **xiaozhi 2.1.0**（稳定运行的保底固件）；
+我们的 `ota_app` 在 `ota_0`/`ota_1` 双槽里 A/B 轮转。NVS（WiFi 凭据）与
+`assets`/`storage` 全程未动。
 
 一键恢复接管前的原样：
 
