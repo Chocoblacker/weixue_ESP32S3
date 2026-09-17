@@ -325,7 +325,80 @@ python3 $OT --port /dev/ttyACM0 read_otadata               # 看当前
   别在用小智的时候碰它的自动升级。
 - 我们自己的 A/B OTA 只需要 `ota_0` / `ota_1` 两槽，现在是齐的。
 
-## 切换启动分区（不刷固件，只改 otadata）
+## 两个按键到底是什么功能（源码级确认）
+
+固件里只有一个按键对象：`Button boot_button_;`。**PWR 键在固件里完全不存在。**
+
+来源：上游 `78/xiaozhi-esp32` 的
+`main/boards/waveshare/esp32-s3-touch-amoled-1.75/esp32-s3-touch-amoled-1.75.cc`
+（板型宏 `CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_75C`，引脚与我们实测一致：
+MCLK=16 / LCD_RST=1 / TOUCH_RST=2；固件二进制里也能找到符号
+`WaveshareEsp32s3TouchAMOLED1inch75::InitializeButtons()`）。
+
+### BOOT 键（GPIO0，`BOOT_BUTTON_GPIO`）—— 唯一被固件处理的键
+
+```cpp
+boot_button_.OnClick([this]() {
+    auto& app = Application::GetInstance();
+    if (app.GetDeviceState() == kDeviceStateStarting) {
+        EnterWifiConfigMode();      // 开机未连网时：进入配网模式
+        return;
+    }
+    app.ToggleChatState();          // 平时：开始/停止对话
+});
+
+#if CONFIG_USE_DEVICE_AEC
+boot_button_.OnDoubleClick([this]() {
+    if (app.GetDeviceState() == kDeviceStateIdle) {
+        app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
+    }
+});
+#endif
+```
+
+| 操作 | 行为 |
+| --- | --- |
+| 单击（启动中） | 进入 WiFi 配网模式 |
+| 单击（平时） | **开始/停止对话**（`ToggleChatState`） |
+| 双击 | 切换回声消除 AEC 开关（仅当编译时开了 `CONFIG_USE_DEVICE_AEC`） |
+
+### PWR 键 —— 纯硬件，接 AXP2101 的 `PWRON`
+
+原理图里的网络标号是 **`PWRON`**（`NLPWRON`），不走 ESP32。固件里也没注册任何按键：
+
+```cpp
+class Pmic : public Axp2101 {
+    Pmic(...) {
+        WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
+        WriteReg(0x27, 0x10);  // hold 4s to power off
+```
+
+| 操作 | 行为 |
+| --- | --- |
+| 短按 | 固件不处理，无软件行为 |
+| **长按 4 秒** | **AXP2101 硬件断电**（寄存器 0x27 = 0x10） |
+| 断电后再按 | AXP2101 PWRON 上电开机 |
+
+> 所以“一个键像重启”的感觉是对的 —— 但本质是**断电 + 重新上电**，不是软件 reboot。
+
+### 还有一个隐形的“自动关机”
+
+```cpp
+power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+power_save_timer_->OnShutdownRequest([this](){ pmic_->PowerOff(); });
+```
+
+参数是（唤醒 GPXX=-1，60 秒进休眠，300 秒请求关机）。且只在**电池放电**时启用
+（`GetBatteryLevel` 里 `if (discharging) power_save_timer_->SetEnabled(true)`）。
+插着 USB 时不会自己关。
+
+### 想给按键加功能？
+
+xiaozhi 的 `Button` 类现成支持：`OnPressDown / OnPressUp / OnLongPress / OnClick /
+OnDoubleClick / OnMultipleClick`。所以给 BOOT 加长按、三击都很容易 —— 改板级 `.cc` 重编就行。
+PWR 键想当普通输入只能去读 AXP2101 的中断寄存器，没有专用 GPIO。
+
+## 切换到启动分区（不刷固件，只改 otadata）
 
 ```bash
 source scripts/env.sh
