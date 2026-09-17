@@ -1,3 +1,5 @@
+# 固定目标芯片，避免忘记 set-target 时静默退回默认的 esp32
+CONFIG_IDF_TARGET="esp32s3"
 # This file was generated using idf.py save-defconfig. It can be edited manually.
 # Shared ESP-IDF v5.5/v6.0 project minimal configuration
 #

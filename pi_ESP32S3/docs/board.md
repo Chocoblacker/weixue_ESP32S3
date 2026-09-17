@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | MCU | ESP32-S3R8 | Xtensa 双核 LX7 @240MHz，512KB SRAM + 384KB ROM |
 | PSRAM | 8MB，Octal（OPI） | 叠封在 SoC 内 |
-| Flash | 32MB NOR，QIO 模式 | 见下方"文档矛盾" |
+| Flash | 32MB NOR，QIO 模式 | **已硬件确认**，见下 | |
 | 显示 | CO5300，QSPI，466×466 | 1.75" 电容触摸 AMOLED，16.7M 色 |
 | 触摸 | CST9217，I2C | 电容触摸控制器 |
 | 电源管理 | AXP2101 | 充电 + 电池管理 + 多路电压输出 |
@@ -17,16 +17,36 @@
 | 电池 | MX1.25 2PIN，3.7V 锂电 | 支持充放电 |
 | 接口 | Type-C | 直连 ESP32-S3 原生 USB（USB-Serial/JTAG） |
 
-### ⚠️ 文档矛盾：Flash 容量
+### ⚠️ 微雪文档矛盾：Flash 容量 —— 已用硬件确认
 
 微雪产品页自相矛盾——"产品特性"写 **16MB**，"板载资源"写 **32MB**。
-以仓库 `examples/esp-idf/*/sdkconfig.defaults` 为准：
+
+`esptool flash_id` 实测：`Detected flash size: 32MB`（manufacturer `c8` = GigaDevice，
+device `4019`）。仓库 `sdkconfig.defaults` 里也是 `CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y`，
+`partitions.csv` 也按 32MB 布局。
+
+**结论：32MB，"16MB"是错的。**
+
+### PSRAM 注意：8MB 是 Octal，但能用多少取决于固件
+
+芯片是 ESP32-S3R8，`esptool` 报 `Embedded PSRAM 8MB`，bootloader 报
+`octal_psram: density 0x03 (64 Mbit)`。但 **8MB 需要固件开 Octal 模式才拿得到**：
+
+| 固件 | 实测可用 PSRAM | 说明 |
+| --- | --- | --- |
+| 官方 BSP 示例（我们的构建） | **7360K** | `CONFIG_SPIRAM_MODE_OCT=y`，用满 |
+| 板上原有的 esp-brookesia | 4043484 字节 (≈3.8MB) | 实际是 QUAD 模式，一半浪费 |
+
+自己建工程时必须带上这一组（否则白丢 4MB）：
 
 ```
-CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
 ```
-
-`partitions.csv` 也按 32MB 布局（`factory` 8M + `storage` 7M）。**按 32MB 处理。**
 
 ## 引脚表
 
@@ -99,6 +119,46 @@ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 | `05_Spec_Analyzer` | 实时音频频谱可视化，64 条对称彩色频谱条 + 峰值跟踪 |
 
 Arduino 侧还有 8 个示例（`01_HelloWorld` ~ `08_*`），库在 `examples/arduino/libraries/`。
+
+## 板子当前固件清单（2026-09-17 首次接管时）
+
+板上不是微雪出厂固件，而是一份带 OTA 分区的布局，里面住着两个不同项目的固件：
+
+| 分区 | 偏移 | project | version | IDF |
+| --- | --- | --- | --- | --- |
+| `factory` | 0x110000 | **esp-brookesia**（微雪手机 Demo） | ac40993 | v5.5.2-249-gf56bea3d1f-dirty |
+| `ota_0` | 0xa10000 | **xiaozhi**（小智 AI 助手） | 2.1.0 | v5.5.2-249-gf56bea3d1f-dirty |
+| `ota_1` | 0xe00000 | 空 | | |
+
+`otadata` 两条记录均为空 → bootloader 回落 factory，所以接管时跑的是 brookesia。
+
+**随后已被我们覆盖**：`factory` 现在是 `lvgl_demo_v9`（首次烧录验证），
+`ota_0` 的 xiaozhi 与 NVS 保持原样未动。整片备份见下。
+
+### 为什么保留了这份分区表
+
+这份布局自带 `otadata` + `ota_0` + `ota_1`，**OTA 能力是现成的**。
+我们没换成微雪示例自带的分区表，因为它会把 `nvs` 放在 `0x9000` 长 `0x6000`，
+与板上的 `nvsfactory` 区重叠 —— **WiFi 凭据会被冲掉**。
+
+## 备份（后悔药）
+
+| 文件 | 内容 |
+| --- | --- |
+| `artifacts/board-backup/flash-2000000-*.bin` | **32MB 整片 flash**（33,554,432 字节，sha256 `2a452d9f…`） |
+| `artifacts/board-backup/partitions.bin` | `0x8000` 起 4KB 分区表原始字节 |
+| `artifacts/ESP32-S3-Touch-AMOLED-1.75C-FactoryOnly-260114.bin` | 微雪官方出厂固件 |
+| `projects/board-partitions.csv` | 板上分区布局的 CSV 形式（新工程直接用它） |
+
+恢复命令：
+
+```bash
+# 恢复整片（回到接管前的原样）
+esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0 artifacts/board-backup/flash-2000000-*.bin
+
+# 只恢复微雪出厂布局 + brookesia Demo
+esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0 artifacts/ESP32-S3-Touch-AMOLED-1.75C-FactoryOnly-260114.bin
+```
 
 ## 参考入口
 

@@ -1,10 +1,10 @@
 # 上游参考仓库：体积大且只读，靠 scripts/fetch-upstream.sh 重新拉取
 pi_ESP32S3/upstream/
 
-# 构建产物 / 二进制固件
-pi_ESP32S3/artifacts/*.bin
-pi_ESP32S3/artifacts/*.zip
-pi_ESP32S3/artifacts/*.elf
+# 构建产物 / 二进制固件（含 32MB 整片 flash 备份，绝不能进 git）
+pi_ESP32S3/artifacts/**/*.bin
+pi_ESP32S3/artifacts/**/*.zip
+pi_ESP32S3/artifacts/**/*.elf
 
 # ESP-IDF 生成物
 build/

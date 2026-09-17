@@ -20,17 +20,26 @@ IDF 源码污染工作区。
 ## 快速开始
 
 ```bash
-# 1. 一次性：装 ESP-IDF v5.5.5 到 ~/esp（需要先装 apt 依赖，见 docs/environment.md）
+# 1. 一次性：装 ESP-IDF v5.5.5 到 ~/esp（需先装 apt 依赖，见 docs/environment.md）
+#    会自动补齐 23 个 git submodule（tarball 装法的必需补丁）
 ./scripts/install-idf.sh
 
 # 2. 每个新终端：加载工具链
 source ./scripts/env.sh
 
-# 3. 复制一个官方示例当起点
+# 3. 刷固件前先整片备份
+./scripts/backup-flash.sh
+
+# 4. 复制一个官方示例当起点；记得用板上分区布局，否则 NVS 会被冲
 cp -r upstream/ESP32-S3-Touch-AMOLED-1.75C/examples/esp-idf/02_lvgl_demo_v9 \
-      projects/lvgl_demo_v9
-cd projects/lvgl_demo_v9 && idf.py set-target esp32s3 && idf.py build
+      projects/my_app
+cp projects/board-partitions.csv projects/my_app/partitions.csv
+#    并在 sdkconfig.defaults 里钉死 CONFIG_IDF_TARGET="esp32s3"
+cd projects/my_app && idf-build && idf-fm
 ```
+
+可用命令（`env.sh` 提供）：`idf-build` / `idf-flash` / `idf-mon` / `idf-fm` /
+`idf-erase` / `idf-port`
 
 ## 板子速览
 
@@ -51,13 +60,32 @@ cd projects/lvgl_demo_v9 && idf.py set-target esp32s3 && idf.py build
 ## 当前状态
 
 - [x] 上游仓库副本落在 `upstream/`
-- [x] 板子确认联网可达（`ping`/ARP 通，MAC 确认为 Espressif）
-- [ ] ESP-IDF 工具链安装（缺 apt 依赖，需要 sudo 密码）
-- [ ] USB 透传（WSL2 需 Windows 侧 usbipd-win）——**首次烧录的前置条件**
-- [ ] 首次烧录官方固件，跑通 build → flash → monitor 闭环
-- [ ] 给自己的固件加 OTA，之后纯 Wi-Fi 迭代，不再需要 USB
+- [x] 板子确认联网可达（MAC `80:45:6b:34:25:18`，OUI 确认为 Espressif）
+- [x] USB 透传（usbipd-win，`/dev/ttyACM0` 可用）
+- [x] ESP-IDF v5.5.5 工具链装好，子模块补齐
+- [x] **build → flash → monitor 闭环打通**，板上跑着 `projects/lvgl_demo_v9`
+- [x] 32MB 整片备份存档
+- [ ] 给固件加 OTA，之后纯 Wi-Fi 迭代，不再需要 USB
+- [ ] 定下自己的工程骨架（现在还用着官方示例副本）
 
-详见 [`docs/environment.md`](docs/environment.md) 与 [`docs/network.md`](docs/network.md)。
+第一次跑通的全过程、踩的坑、板上原有固件的清单，都在
+👉 [`docs/bringup-log.md`](docs/bringup-log.md)
+
+环境与网络细节见 [`docs/environment.md`](docs/environment.md) 与 [`docs/network.md`](docs/network.md)。
+
+## 板上现状（重要）
+
+`factory` 分区（0x110000）现在是我们的 `lvgl_demo_v9`。
+`ota_0` 里原来的 **xiaozhi 2.1.0** 和 NVS（WiFi 凭据）**没被动过** ——
+我们烧录时特意改用板上自带的分区表（`projects/board-partitions.csv`）而不是
+示例自带的，后者会冲掉 NVS。
+
+一键恢复接管前的原样：
+
+```bash
+esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0 \
+  artifacts/board-backup/flash-2000000-*.bin
+```
 
 ## 上游参考
 

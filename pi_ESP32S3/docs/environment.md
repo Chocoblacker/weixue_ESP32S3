@@ -18,16 +18,69 @@
 
 ## 工具链现状
 
+**已装好**（2026-09-17）：ESP-IDF v5.5.5 在 `~/esp/esp-idf`，
+xtensa-esp-elf-gcc 14.2.0，Python 环境在 `~/.espressif/python_env/idf5.5_py3.10_env`。
+每个新终端 `source scripts/env.sh` 即可。
+
+### 安装过程中的四个坑（已写进脚本，但值得知道）
+
+1. **tarball 不含 git submodule**（阻塞级）。GitHub 的 tarball 会漏掉 23 个子模块，
+   包括 `mbedtls`、`lwip`、`esp_wifi/lib`、`esp_phy/lib`、`esp_coex/lib`、`heap/tlsf`，
+   任何一个缺失都编译不了。`install-idf.sh` 会自动调
+   `fix-idf-submodules.py` 用 codeload 按 SHA 补齐（~35 秒）。
+2. **Python tarfile 的 `filter="data"` 会中断解压**。`esp-nimble` 里有个指向子模块外的
+   符号链接，python 过滤器会直接抛异常，**留下半个目录但看起来非空**。
+   所以用系统 `tar` 而不是 `tarfile`。
+3. **仓库没有 commit → CMake 配置失败**。`project.cmake` 在 `PROJECT_VER` 未设时会调
+   `git describe`；仓库没有 `HEAD` 就让 `grabRef.cmake` 报错中止。
+   解法：至少做一次提交，或在工程里 `set(PROJECT_VER "0.1.0")`。
+4. **忘记 `set-target` 会静默用 esp32**。直接 `idf.py build` 时 target 默认 `esp32`，
+   编到 BSP 才报 `GPIO_NUM_45 undeclared`。解法：`sdkconfig.defaults` 里写
+   `CONFIG_IDF_TARGET="esp32s3"`，并统一用 `env.sh` 里的 `idf-build`。
+
+## 烧录与监控
+
+```bash
+source scripts/env.sh
+idf-port                          # 确认 /dev/ttyACM0 在（不在就是 usbipd 掉了，重新 attach）
+
+./scripts/backup-flash.sh         # 改分区表/刷固件前先整片备份（32MB，~3 分钟）
+idf-build                         # = idf.py set-target esp32s3 build
+idf-fm                            # = idf.py -p $PORT flash monitor
+```
+
+### 备份必须分块
+
+USB-Serial-JTAG 上一次性读 32MB 会中途损坏：
+
+```
+A fatal error occurred: Corrupt data, expected 0x1000 bytes but received 0xd55 bytes
+```
+
+`scripts/backup-flash.sh` 用 1MB 分块 + 换速率重试 + 长度校验解决，32 块全过。
+
+### 目标芯片速查（已实测）
+
+```
+Chip is ESP32-S3 (QFN56) (revision v0.2)
+Features: WiFi, BLE, Embedded PSRAM 8MB (AP_3v3)
+USB mode: USB-Serial/JTAG
+MAC: 80:45:6b:34:25:18
+Detected flash size: 32MB
+```
+
+## 工具链安装历史记录
+
 | 组件 | 状态 |
 | --- | --- |
-| `~/esp/esp-idf` | ❌ 未安装 |
-| `idf.py` | ❌ 不在 PATH |
-| git / wget / curl / python3 | ✅ 已装 |
-| libssl-dev / libusb-1.0-0 | ✅ 已装 |
-| flex / bison / gperf | ❌ 缺 |
-| cmake / ninja-build / ccache | ❌ 缺 |
-| python3-pip / python3-venv | ❌ 缺 |
-| dfu-util | ❌ 缺（本板走 USB-Serial/JTAG，基本用不到） |
+| `~/esp/esp-idf` | ✅ v5.5.5（tarball + 子模块补齐） |
+| `idf.py` | ✅ 由 `scripts/env.sh` 注入 PATH |
+| git / wget / curl / python3 | ✅ |
+| libssl-dev / libusb-1.0-0 | ✅ |
+| flex / bison / gperf | ✅ |
+| cmake / ninja-build / ccache | ✅ |
+| python3-pip / python3-venv | ✅ |
+| dfu-util | ✅ |
 
 ### 一次性装 apt 依赖（需要 sudo 密码）
 
