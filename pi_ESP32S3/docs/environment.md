@@ -145,6 +145,75 @@ ls -l /dev/ttyACM*
 但装完 usbipd-win 后，日常开发可以一直待在 WSL 里，Windows 侧不用再管。
 烧上我们自己带 OTA 的固件之后，后续迭代可以纯 Wi-Fi，U 盘都不用插。
 
+## 救砖流程（无 WiFi / 板子看起来死了）
+
+### 先记住一条：这块芯片**刷不坏**
+
+ESP32-S3 的 **ROM bootloader 在芯片内部的 mask ROM 里，不可写**。
+它同时提供 USB-Serial-JTAG 下载通道，所以只要芯片没硬件损坏、eFuse 没被改，
+**USB 烧录永远可用**，跟固件里写了什么、WiFi 能不能用完全无关。
+
+完整回退链：
+
+```
+ota 槽 A ──失败──> ota 槽 B ──都失败──> factory(小智) ──连它也坏──> ROM 下载模式(USB)
+```
+
+### 到了没有 WiFi 的地方怎么办
+
+1. 板子会正常启动 `factory` = **小智**（它不依赖网络也能起来）。没网时它会进
+   **AP 配网模式**：屏幕显示热点名 `Xiaozhi-XXXX`，等你用手机连上去配网。
+   （实测它在这个状态下很稳定，不会重启循环。）
+2. 把 **数据线**插到电脑（不是充电头）→ 跑：
+
+   ```bash
+   ./scripts/attach-usb.sh        # 自动找到 303a:1001 并 attach 进 WSL
+   ```
+
+3. 然后就能干活了：
+
+   ```bash
+   source scripts/env.sh
+   python3 scripts/watch-serial.py 30           # 看日志（被动，不复位）
+   ./scripts/flash-app.sh projects/ota_app 0     # 重新烧我们的 app
+   esptool.py --chip esp32s3 -p /dev/ttyACM0 flash_id   # 任意读写
+   ```
+
+### 看不到 `303a:1001` 怎么办
+
+按这个顺序排查：
+
+| 检查 | 说明 |
+| --- | --- |
+| 线是**数据线**吗 | 充电线只有 VBUS 没有 D+/D-，插上什么都不会出现 |
+| 插的是**电脑**吗 | 插充电头只能供电，Windows 看不到设备 |
+| 按住 **BOOT** 再按 **PWR** | 强制进 ROM 下载模式，ROM 一定会枚举 `303a:1001`（绕过固件是否启用 USB 串口）|
+| 临时退出**火绒** | 它的 `hrdevmon` 过滤驱动会干扰 usbipd |
+| `usbipd list` 里在 Persisted 而非 Connected | 说明设备当前不在线（断电/拔插），不是 attach 问题 |
+
+> `bind` 是持久的（已 `--force bind`，GUID `e7bc75d8-…`），**插上后不需要重新 bind，只要 attach**。
+> usbipd 5.3.0 **不支持自动 attach**（`policy` 只能 `AutoBind`），所以用 `scripts/attach-usb.sh`。
+
+### 一个反直觉的细节：没网时别靠 OTA 恢复
+
+我们固件的健康检查条件是“连上 WiFi”。所以在没网的地方：
+
+- **USB 烧录**（`flash-app.sh`）→ otadata 状态是 `UNDEFINED` → **不会回滚**，安全
+- 但如果之前是通过 **OTA** 推的镜像（状态 `PENDING_VERIFY`）而它连不上网 →
+  下次复位会被回滚。**这是设计行为**，不是 bug —— 但在无网环境下调试时要知道
+  这件事，别把回滚当成“固件坏了”。
+
+### `factory` 里放什么，是我们自己的选择
+
+`factory` 只是“**一个 OTA 写不进去的槽**”，里面放什么由我们决定（刷固件就能换）：
+
+| 放什么 | 好处 | 代价 |
+| --- | --- | --- |
+| **小智**（当前）| 板子能当 AI 音箱用；两个 OTA 槽都废时它还能起来 | 它**不能**帮你恢复我们的 app，最终还得靠 USB |
+| **我们 app 的已知 good 版本** | 两个 OTA 槽都废时，factory 跑我们的 app → **能靠 WiFi 自救**，完全不用 USB | 小智得挪走（而它只能在 factory 里正常工作）|
+
+想让“彻底不插 USB”成立，后者才是真正的保底。这是个可以以后再做的取舍。
+
 ## 网络坑（已踩，别再踩）
 
 ### 1. `git clone https://github.com/...` 卡死 / GnuTLS 报错
