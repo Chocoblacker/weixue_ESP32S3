@@ -330,58 +330,111 @@ python3 $OT --port /dev/ttyACM0 read_otadata               # 看当前
 固件里只有一个按键对象：`Button boot_button_;`。**PWR 键在固件里完全不存在。**
 
 来源：上游 `78/xiaozhi-esp32` 的
-`main/boards/waveshare/esp32-s3-touch-amoled-1.75/esp32-s3-touch-amoled-1.75.cc`
+`main/boards/waveshare/esp32-s3-touch-amoled-1.75/`
 （板型宏 `CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_75C`，引脚与我们实测一致：
 MCLK=16 / LCD_RST=1 / TOUCH_RST=2；固件二进制里也能找到符号
 `WaveshareEsp32s3TouchAMOLED1inch75::InitializeButtons()`）。
 
-### BOOT 键（GPIO0，`BOOT_BUTTON_GPIO`）—— 唯一被固件处理的键
+### BOOT 键（GPIO0）—— 本质上就是“麦克风开关”
 
 ```cpp
 boot_button_.OnClick([this]() {
-    auto& app = Application::GetInstance();
-    if (app.GetDeviceState() == kDeviceStateStarting) {
-        EnterWifiConfigMode();      // 开机未连网时：进入配网模式
-        return;
-    }
-    app.ToggleChatState();          // 平时：开始/停止对话
+    if (app.GetDeviceState() == kDeviceStateStarting) { EnterWifiConfigMode(); return; }
+    app.ToggleChatState();
 });
-
 #if CONFIG_USE_DEVICE_AEC
-boot_button_.OnDoubleClick([this]() {
-    if (app.GetDeviceState() == kDeviceStateIdle) {
-        app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
-    }
-});
+boot_button_.OnDoubleClick(... 切换 AEC ...);
 #endif
 ```
 
-| 操作 | 行为 |
+`ToggleChatState()` 只是投一个事件，真正的处理在
+`Application::HandleToggleChatEvent()`（`main/application.cc`）里，按当前状态分派：
+
+| 当前状态 | 单击 BOOT 的效果 |
 | --- | --- |
-| 单击（启动中） | 进入 WiFi 配网模式 |
-| 单击（平时） | **开始/停止对话**（`ToggleChatState`） |
-| 双击 | 切换回声消除 AEC 开关（仅当编译时开了 `CONFIG_USE_DEVICE_AEC`） |
+| `Starting`（刚开机未配网） | 进入 WiFi 配网模式 |
+| `Idle`（空闲，音频通道已关） | **打开音频通道 → 开始听**（麦克风开） |
+| `Listening`（正在听） | **`CloseAudioChannel()` → 停止听**（麦克风关） |
+| `Speaking`（正在说话） | **`AbortSpeaking()` → 打断它** |
+| `WifiConfiguring`（配网模式） | **开启麦克风/喇叭回路自测**（`EnableAudioTesting(true)`） |
+| `AudioTesting` | 关自测 → 回配网模式 |
+| `Notifying` | 停止提示音 |
+| 双击 | 切换回声消除 AEC（仅当编译时开了 `CONFIG_USE_DEVICE_AEC`） |
 
-### PWR 键 —— 纯硬件，接 AXP2101 的 `PWRON`
+> 所以“切换麦克风开关”这个描述是**准的**，而且还附带两个隐藏功能：
+> **说话时按 = 打断它**、**配网模式下按 = 音频自测**。
 
-原理图里的网络标号是 **`PWRON`**（`NLPWRON`），不走 ESP32。固件里也没注册任何按键：
+### PWR 键 —— 固件零处理，纯硬件
+
+查完了整个驱动链，`main/boards/common/axp2101.cc` **全文只有 815 字节**：
+
+```cpp
+class Axp2101 : public I2cDevice {
+    bool IsCharging(); bool IsDischarging(); bool IsChargingDone();
+    int GetBatteryLevel(); float GetTemperature();
+    void PowerOff();   // 写 reg 0x10 bit0
+};
+```
+
+**没有任何中断配置、没有读 PWRON、没有重启逻辑。** 板级构造函数里也只创建了
+`boot_button_`。原理图里 PWR 的网络标号是 **`PWRON`**（接 AXP2101 的电源键引脚，
+不连 ESP32 的 GPIO）。固件对它的全部动作就是给 PMIC 写两个寄存器：
 
 ```cpp
 class Pmic : public Axp2101 {
-    Pmic(...) {
-        WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
-        WriteReg(0x27, 0x10);  // hold 4s to power off
+    WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
+    WriteReg(0x27, 0x10);  // hold 4s to power off
 ```
 
 | 操作 | 行为 |
 | --- | --- |
-| 短按 | 固件不处理，无软件行为 |
-| **长按 4 秒** | **AXP2101 硬件断电**（寄存器 0x27 = 0x10） |
-| 断电后再按 | AXP2101 PWRON 上电开机 |
+| 短按 | **固件层无任何反应**；硬件层实测会重新枚举 USB（见下） |
+| 长按 ≥4 秒 | **AXP2101 硬件断电**（reg 0x27 = 0x10），再按一下才上电 |
 
-> 所以“一个键像重启”的感觉是对的 —— 但本质是**断电 + 重新上电**，不是软件 reboot。
+### 怎么区分“真断电”和“软复位”—— 看 USB 端口
 
-### 还有一个隐形的“自动关机”
+这是目前最好用的判据，已存进 `scripts/watch-serial.py` 的注释：
+
+| 现象 | 含义 |
+| --- | --- |
+| `/dev/ttyACM0` **消失**，usbipd 状态从 `Attached` 退回 `Shared` | **真·断电**（设备重新枚举了） |
+| 端口还在，但日志里出现启动横幅 `rst:0x..` | 软复位（芯片复位，USB 设备不重新枚举） |
+| 端口在、无启动横幅，只有状态机日志 | 纯软件行为（按键事件） |
+
+实测佐证（`dmesg`）：
+
+```
+[00:44:04] vhci_hcd: unlink->seqnum ... urb->status -104   ← esptool 软复位：只有 URB unlink，无 disconnect
+[00:55:01] vhci_hcd: connection closed / disconnect device  ← 设备从 USB 上消失 => 真的掉过电
+```
+
+### 复位原因对照表（启动横幅里的 `rst:0x..`）
+
+| 码 | 含义 |
+| --- | --- |
+| `0x1` | POWERON —— 掉电后重新上电（拔插 USB / PMIC 断电） |
+| `0x3` | RTC_SW_SYS_RST —— RTC 域软复位 |
+| `0xc` | SW_CPU_RESET —— 软件重启 |
+| `0xf` | BROWN_OUT —— 电压跌落 |
+| `0x10` | RTCWDT_RTC_RESET —— RTC 看门狗 |
+| `0x15` | USB_UART_CHIP_RESET —— 被 USB-Serial-JTAG 复位（esptool / idf.py monitor） |
+
+### ❗ usbipd 的 attach 会因为设备重新枚举而掉线
+
+**每次“真断电”或拔插 USB，都要重新 attach：**
+
+```powershell
+usbipd list                       # 确认 1-1 是 Shared；BUSID 可能变
+usbipd attach --wsl --busid=<BUSID>
+```
+
+在 WSL 里先 `ls /dev/ttyACM*` 确认；不在就是掉线了。`scripts/env.sh` 的 `idf-port`
+也干这个。
+
+> 注意：非登录式的 `powershell.exe -NoProfile` 里 `usbipd` **不在 PATH**，
+> 得用全路径 `& 'C:\Program Files\usbipd-win\usbipd.exe' list`。
+
+### 另一个隐形功能：空闲自动关机
 
 ```cpp
 power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
@@ -390,13 +443,13 @@ power_save_timer_->OnShutdownRequest([this](){ pmic_->PowerOff(); });
 
 参数是（唤醒 GPXX=-1，60 秒进休眠，300 秒请求关机）。且只在**电池放电**时启用
 （`GetBatteryLevel` 里 `if (discharging) power_save_timer_->SetEnabled(true)`）。
-插着 USB 时不会自己关。
+**插着 USB 时不会自己关。**
 
 ### 想给按键加功能？
 
 xiaozhi 的 `Button` 类现成支持：`OnPressDown / OnPressUp / OnLongPress / OnClick /
-OnDoubleClick / OnMultipleClick`。所以给 BOOT 加长按、三击都很容易 —— 改板级 `.cc` 重编就行。
-PWR 键想当普通输入只能去读 AXP2101 的中断寄存器，没有专用 GPIO。
+OnDoubleClick / OnMultipleClick`。给 BOOT 加长按、三击很容易 —— 改板级 `.cc` 重编就行。
+PWR 想当普通输入只能去读 AXP2101 的中断寄存器（0x48-0x4A），没有专用 GPIO。
 
 ## 切换到启动分区（不刷固件，只改 otadata）
 
