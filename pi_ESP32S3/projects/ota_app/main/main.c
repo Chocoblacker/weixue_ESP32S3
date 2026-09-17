@@ -41,6 +41,17 @@ static void restart_soon(void *arg)
     esp_restart();
 }
 
+#if SABOTAGE_NO_WIFI
+// 捣乱模式专用：模拟一个“能启动但连不上网”的坏固件，并自己重启制造 boot loop
+static void sabotage_reboot_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(20000));
+    ESP_LOGE(TAG, "捣乱模式：20 秒到，自己重启（模拟 boot loop）");
+    esp_restart();
+}
+#endif
+
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
     const esp_app_desc_t *d = esp_app_get_description();
@@ -161,6 +172,34 @@ void app_main(void)
     app_ota_log_state();
     app_display_start();
     app_display_status("booting", "", APP_FW_TAG);
+
+#if SABOTAGE_NO_WIFI
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║  捣乱模式：故意不连 WiFi、不确认镜像、20 秒后自己重启。      ║
+    // ║  预期：下次启动时 bootloader 把它标为 ABORTED 并回滚。      ║
+    // ╚══════════════════════════════════════════════════════════════╝
+    ESP_LOGW(TAG, "########################################################");
+    ESP_LOGW(TAG, "!!! 捣乱模式 SABOTAGE_NO_WIFI 已启用 !!!");
+    ESP_LOGW(TAG, "!!! 本固件不会连 WiFi、不会确认自己、20 秒后重启 !!!");
+    ESP_LOGW(TAG, "!!! 预期：下次启动时被 bootloader 标 ABORTED 并回滚 !!!");
+    ESP_LOGW(TAG, "########################################################");
+
+    esp_ota_img_states_t st;
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    if (run && esp_ota_get_state_partition(run, &st) == ESP_OK) {
+        ESP_LOGW(TAG, "本镜像当前状态 = %d (NEW=0 / PENDING_VERIFY=1)", (int)st);
+        if (st == ESP_OTA_IMG_NEW) {
+            ESP_LOGW(TAG, "第一次启动：还没被标 PENDING_VERIFY，本次重启后才会被标");
+        } else if (st == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGW(TAG, "已经不是第一次启动且仍未确认 —— 下次启动就要被回滚了");
+        }
+    }
+
+    app_display_status("SABOTAGE", "no wifi on purpose", APP_FW_TAG);
+    xTaskCreate(sabotage_reboot_task, "sabotage", 3072, NULL, 4, NULL);
+    xTaskCreate(status_task, "status", 4096, NULL, 3, NULL);
+    return;   // 决不走到下面 —— 不连 WiFi、不起 HTTP、不确认镜像
+#endif
 
     s_evt = xEventGroupCreate();
     ESP_ERROR_CHECK(app_wifi_start(s_evt));

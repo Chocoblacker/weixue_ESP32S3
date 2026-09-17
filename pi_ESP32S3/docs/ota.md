@@ -85,6 +85,68 @@ OTA 不进去了（只能拆机插 USB）。用"能连上网"当健康检查，�
 （brookesia / xiaozhi 连过网留下的），驱动默认 `WIFI_STORAGE_FLASH` 会读回来，
 所以 `esp_wifi_connect()` 直接就连上了。启动日志里会打印恢复出的 SSID，方便排查。
 
+## 自动回滚验收（已实机验证 2026-09-18）
+
+这是"敢用纯网络 OTA"的前提，必须验一次。做法：造一个**能启动但连不上网**的坏固件，
+看板子能不能自己爬回来。
+
+### 怎么重跑这个验收
+
+1. `projects/ota_app/main/app_version.h` 里把 `SABOTAGE_NO_WIFI` 改成 **1**
+2. `idf.py build && curl --data-binary @build/ota_app.bin http://192.168.31.46/ota`
+3. 等 30 秒，然后 `curl http://192.168.31.46/`
+4. **预期：`fw` 回到上一版，`running` 回到另一个槽** —— 说明回滚成功
+5. ⚠️ **验收完必须把 `SABOTAGE_NO_WIFI` 改回 0 并重新推送**，否则后面的固件都连不上网
+
+那个开关打开时，固件会：不连 WiFi → 因此永远不调
+`esp_ota_mark_app_valid_cancel_rollback()` → 20 秒后自己 `esp_restart()` 制造 boot loop。
+
+### 实测证据（三级）
+
+**① 串口日志**
+```
+启动 1: Loaded app from partition at offset 0xa10000   <- 坏固件进 ota_0
+        镜像状态 : PENDING_VERIFY(待确认)
+        !!! 捣乱模式 SABOTAGE_NO_WIFI 已启用 !!!
+        [状态] ip=0.0.0.0                             <- 没网，谁也连不上
+        E 捣乱模式：20 秒到，自己重启（模拟 boot loop）
+
+启动 2: Loaded app from partition at offset 0xe00000   <- ★ 回滚到 ota_1
+        镜像状态 : VALID(已确认)
+        健康检查通过（已联网）
+        [状态] ip=192.168.31.46 ... running=ota_1 state=VALID(已确认)
+```
+
+**② HTTP 状态**：`fw` 回到上一版、`running` 回到另一个槽、`state=VALID(已确认)`
+
+**③ otadata 原始字节**（最硬的证据）
+```
+条目0 @0x0000: seq=4 -> ota_0  state=ABORTED   <- bootloader 亲手盖的"这版不行"
+条目1 @0x1000: seq=2 -> ota_1  state=VALID     <- 被选中启动
+```
+
+**结论：从推送坏固件到板子自救完成，全程约 30 秒，无人干预、无需 USB。**
+
+### 为什么回滚发生在"第 2 次启动"
+
+bootloader 的启动流程（`bootloader_support/src/bootloader_utility.c`）：
+
+```c
+// 1. 先把所有 PENDING_VERIFY 标成 ABORTED —— 这就是"上次启动没确认"的惩罚
+for (int i = 0; i < 2; ++i)
+    if (otadata[i].ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        otadata[i].ota_state = ESP_OTA_IMG_ABORTED;   // 该条目从此不再有效
+        ...
+    }
+// 2. 选有效条目时跳过它
+// 3. 选中的若是 NEW，标成 PENDING_VERIFY，等 app 来确认
+if (otadata[active_otadata].ota_state == ESP_OTA_IMG_NEW)
+    otadata[active_otadata].ota_state = ESP_OTA_IMG_PENDING_VERIFY;
+```
+
+所以时间线是：**启动 1**（NEW → PENDING_VERIFY，跑坏固件）→ 重启 →
+**启动 2**（PENDING_VERIFY → ABORTED，改选另一个槽）。
+
 ## 排错
 
 | 症状 | 原因 / 处理 |
@@ -118,6 +180,17 @@ otatool 用 `spi_flash_sec_size >> 1` = 2048 当条目间距，而 bootloader �
 `seq`（看着像"两个槽都有效"），其实 2048 那处是 bootloader 不看的垃圾。
 判启动槽以 **偏移 0** 的那条为准。
 
+### `#ifdef` 和 `#if` 的经典陷阱（我在这个项目里真实踩到）
+
+捣乱开关写成 `#define SABOTAGE_NO_WIFI 0`（想关掉）却用 `#ifdef SABOTAGE_NO_WIFI` 判断
+—— **`#ifdef` 只看宏有没有被定义，不看值**，所以设成 `0` 依然是"开启"。
+必须用 `#if SABOTAGE_NO_WIFI`。
+
+怎么发现的：**看构建产物大小**。捣乱版因为 `return` 之后那段成了死代码、
+WiFi/HTTP 被链接器 GC 掉，只有 721200 字节；正常版是 1289600 字节。
+推之前顺手看一眼大小就避免了又一次乱推。
+**养成习惯：每次 OTA 前对一眼 app 大小。**
+
 ### `idf.py flash` 的三个副作用
 
 1. app 写到 `factory` → 覆盖小智
@@ -126,7 +199,8 @@ otatool 用 `spi_flash_sec_size >> 1` = 2048 当条目间距，而 bootloader �
 
 ## 下一步可以做的
 
-- [ ] 双槽自动交替的回归测试（连推两次，确认 ota_0 → ota_1 → ota_0）
-- [ ] 故意推一个"能启动但连不上网"的镜像，验证自动回滚真的生效
+- [x] 双槽 A/B 交替（已验证 ota_0 → ota_1 → ota_0）
+- [x] 故意推"能启动但连不上网"的镜像，验证自动回滚（已验证，见上）
 - [ ] `POST /ota` 加个 token，避免同网段别人乱刷
 - [ ] HTTPS 拉取式 OTA（`esp_https_ota`）+ 版本比较，做成"检查更新"
+- [ ] 板子重启后主动上报（体检开机次数 / 崩溃计数）
