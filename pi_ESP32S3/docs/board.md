@@ -160,6 +160,81 @@ esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0 artifacts/board-backup/f
 esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0 artifacts/ESP32-S3-Touch-AMOLED-1.75C-FactoryOnly-260114.bin
 ```
 
+## xiaozhi 是什么（挖到底了）
+
+**小智 AI**，开源项目 [`78/xiaozhi-esp32`](https://github.com/78/xiaozhi-esp32)。
+不是玩具 demo，是国内非常流行的嵌入式 AI 语音助手框架：
+
+- 离线唤醒词（ESP-SR，默认“你好小智”）
+- WebSocket 或 MQTT+UDP 传输，OPUS 编解码，流式 ASR + LLM + TTS
+- 声纹识别、屏幕表情、多语言
+- **MCP 协议**做设备控制（音量/灯/电机/GPIO）
+- 接 Qwen / DeepSeek 等大模型，官方云 `api.tenclass.net` + [xiaozhi.me](https://xiaozhi.me/) 控制台
+
+### 板上这一份：第三方定制版，不是干净的上游发布
+
+| 证据 | 含义 |
+| --- | --- |
+| `idf_ver = v5.5.2-249-gf56bea3d1f-dirty` | `-dirty` = 用**改过的** IDF 树编译的（和 factory 里的 brookesia 共用同一套） |
+| 固件里有 `pcn7cs20v8cr.feishu.cn/wiki/...` | 烧进了**飞书文档链接**，说明来自某个中文教程/店铺的定制 fork |
+| 板型串 `WaveshareEsp32s3TouchAMOLED1.75C` / `waveshare-s3-touch-amoled-1.75c` | 对该板有**原生支持**（上游是后来才合入的，来自 fork PR） |
+| `api.tenclass.net/xiaozhi/ota/` | 连的是**官方云**，不是自建服务器 |
+
+### 实测行为（otatool 切到 ota_0 后抓的日志）
+
+```
+I (2610) MCP: Add tool: self.reboot / self.upgrade_firmware
+I (2620) MCP: Add tool: self.screen.snapshot / self.screen.preview_image
+I (2630) Assets: The partition size is 9216 KB
+E (2730) WifiStation: Failed to open NVS: 4354
+W (2740) SsidManager: NVS namespace wifi doesn't exist
+I (4250) StateMachine: State: starting -> wifi_configuring
+I (4300) WifiConfigurationAp: Access Point started with SSID Xiaozhi-2519
+I (4310) esp_netif_lwip: DHCP server started on IP: 192.168.4.1
+W (4330) Application: 配网模式: 手机连接热点 Xiaozhi-2519，浏览器访问 http://192.168.4.1
+```
+
+### ⚠️ 关键发现：板子上那个 WiFi 不是 xiaozhi 配的
+
+`NVS namespace wifi doesn't exist` —— xiaozhi 自己的 NVS 里**没有** WiFi 凭据，
+所以它一启动就进了 AP 配网模式。
+
+**接管时板子连着 `192.168.31.46`，那套凭据属于 `factory` 里的 brookesia**，
+不是 xiaozhi 的。两个固件各用各的 NVS 命名空间。
+
+### 想真正玩一下 xiaozhi 的步骤
+
+1. 手机连热点 **`Xiaozhi-2519`**（数字是 MAC 后两字节）
+2. 浏览器开 **http://192.168.4.1** → 填你家 WiFi 的 SSID/密码
+3. 板子连上网后向 `api.tenclass.net` 要**激活码**，显示在屏上
+4. 去 [xiaozhi.me](https://xiaozhi.me/) 注册（有免费 Qwen 实时模型额度）→ 控制台添加设备、填激活码
+5. 对着板子说“你好小智”
+
+### 自带的自升级能力（对我们的影响）
+
+xiaozhi 有 `self.upgrade_firmware` 这个 MCP 工具，**它自己能 OTA**，
+而且用的是同一套轮转算法 → 如果用它，它可能占掉 `ota_0` / `ota_1`。
+按“xiaozhi 不丢就行”的决定，这不是问题：文件在手，直接收回槽位。
+
+## 切换启动分区（不刷固件，只改 otadata）
+
+```bash
+source scripts/env.sh
+OT=$IDF_PATH/components/app_update/otatool.py
+
+# 启动 xiaozhi（ota_0）
+python3 $OT --port /dev/ttyACM0 switch_ota_partition --slot 0
+
+# 启动我们的 lvgl_demo_v9（factory，= 擦空 otadata）
+python3 $OT --port /dev/ttyACM0 erase_otadata
+
+# 看当前启动项
+python3 $OT --port /dev/ttyACM0 read_otadata
+```
+
+> 注意：`otatool` **不接受 `--chip`**（它的 `--esptool-args` 会把 `--chip` 当成自己的值而报错）。
+> 不带就行，esptool 自动探测。
+
 ## 参考入口
 
 - 原理图 PDF：`upstream/ESP32-S3-Touch-AMOLED-1.75C/Schematic/`
