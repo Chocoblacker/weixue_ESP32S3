@@ -1,0 +1,13 @@
+# Generated state and private provisioning data
+**/build*/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+**/translator_secrets.h
+**/*secrets*.local*
+**/.env
+**/.env.*
+**/nvs*.bin
+**/flash*.bin
+*.log
+__pycache__/
